@@ -22,15 +22,9 @@
 #include "overlay_packet.h"
 #include "constants.h"
 #include "conf.h"
+#include "mem.h"
 
-#define RULE_ALLOW 0
-#define RULE_DROP (1<<0)
-#define RULE_SOURCE (1<<1)
-#define RULE_DESTINATION (1<<2)
-#define RULE_SRC_PORT (1<<3)
-#define RULE_DST_PORT (1<<4)
-
-struct packet_rule{
+struct packet_rule {
   struct subscriber *source;
   struct subscriber *destination;
   mdp_port_t src_start;
@@ -40,7 +34,8 @@ struct packet_rule{
   uint8_t flags;
   struct packet_rule *next;
 };
-struct packet_rule *global_rules = NULL;
+
+static struct packet_rule *packet_rules = NULL;
 
 static int match_rule(struct internal_mdp_header *header, struct packet_rule *rule)
 {
@@ -66,18 +61,10 @@ static int match_rule(struct internal_mdp_header *header, struct packet_rule *ru
 
 int allow_incoming_packet(struct internal_mdp_header *header)
 {
-  struct packet_rule *rule = header->source->source_rules;
-  while(rule){
+  struct packet_rule *rule;
+  for (rule = packet_rules; rule; rule = rule->next)
     if (match_rule(header, rule))
       return rule->flags & RULE_DROP;
-    rule = rule->next;
-  }
-  rule = global_rules;
-  while(rule){
-    if (match_rule(header, rule))
-      return rule->flags & RULE_DROP;
-    rule = rule->next;
-  }
   return RULE_ALLOW;
 }
 
@@ -90,30 +77,242 @@ static void free_rule_list(struct packet_rule *rule)
   }
 }
 
-static int drop_rule(struct subscriber *subscriber, void *UNUSED(context))
+/*
+ * rules := optspace rule optspace ( sep optspace rule optspace ){0..}
+ * sep := "\n" | ";"
+ * rule := verb space pattern
+ * verb := "allow" | "drop"
+ * pattern := "all" | srcpat optspace [ dstpat ] | dstpat optspace [ srcpat ]
+ * srcpat := "<" optspace endpoint
+ * dstpat := ">" optspace endpoint
+ * endpoint := [ sid ] [ optspace ":" optspace portrange ]
+ * sid := sidhex | "broadcast"
+ * sidhex := hexdigit {64}
+ * portrange := port [ optspace "-" optspace port ]
+ * port := hexport | decport
+ * hexport := "0x" hexdigit {1..8}
+ * decport := decdigit {1..10}
+ * decdigit := "0".."9"
+ * hexdigit := decdigit | "A".."F" | "a".."f"
+ * optspace := " " {0..}
+ * space := " " {1..}
+ */
+
+static int _space(const char **cursor)
 {
-  free_rule_list(subscriber->source_rules);
-  subscriber->source_rules=NULL;
+  if (**cursor != ' ')
+    return 0;
+  while (**cursor == ' ')
+    ++*cursor;
+  return 1;
+}
+
+static int _optspace(const char **cursor)
+{
+  _space(cursor);
+  return 1;
+}
+
+static int _sep(const char **cursor)
+{
+  if (**cursor == '\n' || **cursor == ';') {
+    ++*cursor;
+    return 1;
+  }
   return 0;
 }
 
-void load_mdp_packet_rules(const char *UNUSED(filename))
+static int _port(const char **cursor, mdp_port_t *portp)
 {
-  // drop all existing rules
-  free_rule_list(global_rules);
-  global_rules=NULL;
-  enum_subscribers(NULL, drop_rule, NULL);
-  
-  // TODO parse config [file]?
-  
-  /* 
-   * Rule format?
-   * one line per rule, name value pairs for parameters?
-   * eg;
-   * 
-   * DROP,source=FF...,destination_port=00[-99]
-   * DROP,destination=broadcast
-   * ALLOW
-   * 
-   * */
+  const char *end;
+  if (!(((*cursor)[0] == '0' && (*cursor)[1] == 'x') ? str_to_uint32(*cursor + 2, 16, portp, &end) : str_to_uint32(*cursor, 10, portp, &end)))
+    return 0;
+  *cursor = end;
+  return 1;
+}
+
+static int _portrange(const char **cursor, mdp_port_t *port_start, mdp_port_t *port_end)
+{
+  if (!_port(cursor, port_start))
+    return 0;
+  const char *end = *cursor;
+  _optspace(cursor);
+  if (**cursor == '-') {
+    ++*cursor;
+    _optspace(cursor);
+    if (!_port(cursor, port_end))
+      return 0;
+  } else {
+    *cursor = end;
+    *port_end = *port_start;
+  }
+  return 1;
+
+}
+
+static int _endpoint(const char **cursor, uint8_t *flagsp, uint8_t sid_flag, uint8_t port_flag, struct subscriber **subscr, mdp_port_t *port_start, mdp_port_t *port_end)
+{
+  const char *end;
+  sid_t sid;
+  if (strn_to_sid_t(&sid, *cursor, &end) == 0) {
+    if ((*subscr = find_subscriber(sid.binary, sizeof sid.binary, 1)) == NULL)
+      return 0;
+    *flagsp |= sid_flag;
+    *cursor = end;
+  } else if (end != *cursor)
+    return 0;
+  _optspace(cursor);
+  if (**cursor == ':') {
+    ++*cursor;
+    _optspace(cursor);
+    if (!_portrange(cursor, port_start, port_end))
+      return 0;
+    *flagsp |= port_flag;
+  } else
+    *cursor = end;
+  return 1;
+}
+
+static int _srcpat(const char **cursor, struct packet_rule *rule)
+{
+  if (**cursor != '<')
+    return 0;
+  ++*cursor;
+  _optspace(cursor);
+  return _endpoint(cursor, &rule->flags, RULE_SOURCE, RULE_SRC_PORT, &rule->source, &rule->src_start, &rule->src_end);
+}
+
+static int _dstpat(const char **cursor, struct packet_rule *rule)
+{
+  if (**cursor != '>')
+    return 0;
+  ++*cursor;
+  _optspace(cursor);
+  return _endpoint(cursor, &rule->flags, RULE_DESTINATION, RULE_DST_PORT, &rule->destination, &rule->dst_start, &rule->dst_end);
+}
+
+static int _pattern(const char **cursor, struct packet_rule *rule)
+{
+  if (strcmp(*cursor, "all") == 0)
+    return 1;
+  if (**cursor == '<')
+    return _srcpat(cursor, rule) && _optspace(cursor) && (**cursor == '>' ? _dstpat(cursor, rule) : 1);
+  if (**cursor == '>')
+    return _dstpat(cursor, rule) && _optspace(cursor) && (**cursor == '<' ? _srcpat(cursor, rule) : 1);
+  return 0;
+}
+
+static int _verb(const char **cursor, struct packet_rule *rule)
+{
+  if (strcmp(*cursor, "allow") == 0)
+    return 1;
+  if (strcmp(*cursor, "drop") == 0) {
+    rule->flags |= RULE_DROP;
+    return 1;
+  }
+  return 0;
+}
+
+static int _rule(const char **cursor, struct packet_rule **rulep)
+{
+  assert(*rulep == NULL);
+  if ((*rulep = emalloc_zero(sizeof(struct packet_rule))) == NULL)
+    return -1;
+  if (_verb(cursor, *rulep) && _optspace(cursor) && _pattern(cursor, *rulep))
+    return 1;
+  free(*rulep);
+  *rulep = NULL;
+  return 0;
+}
+
+static int _rules(const char **cursor, struct packet_rule **listp)
+{
+  assert(*listp == NULL);
+  _optspace(cursor);
+  int r;
+  if ((r = _rule(cursor, listp)) == -1)
+    return -1;
+  if (!r)
+    return 0;
+  assert(*listp != NULL);
+  listp = &(*listp)->next;
+  assert(*listp == NULL);
+  _optspace(cursor);
+  while (**cursor && _sep(cursor) && **cursor) {
+    _optspace(cursor);
+    if ((r = _rule(cursor, listp)) == -1)
+      return -1;
+    if (!r)
+      return 0;
+    assert(*listp != NULL);
+    listp = &(*listp)->next;
+    assert(*listp == NULL);
+    _optspace(cursor);
+  }
+  return **cursor == '\0';
+}
+
+/* Parse the given text as a list of MDP filter rules and return the pointer to the head of the list
+ * if successful.  List elements are allocated using malloc(3).  The 'source' and 'destination'
+ * subscriber structs are allocated using find_subscriber() for each SID parsed in the rules.  Does
+ * not alter the rules currently in force -- use set_mdp_packet_rules() for that.
+ *
+ * Returns NULL if the parsing fails because of either a malformed text or system failure (out of
+ * memory).
+ *
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+struct packet_rule *parse_mdp_packet_rules(const char *text)
+{
+  struct packet_rule *rules = NULL;
+  int r;
+  if ((r = _rules(&text, &rules)) == 1)
+    return rules;
+  if (r == -1)
+    WHY("failure parsing packet filter rules");
+  else
+    WHYF("malformed packet filter rule at %s", alloca_toprint(30, text, strlen(text)));
+  free_rule_list(rules);
+  return NULL;
+}
+
+/* Replace the current packet filter rules with the given new list of rules.
+ *
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+void set_mdp_packet_rules(struct packet_rule *rules)
+{
+  clear_mdp_packet_rules();
+  packet_rules = rules;
+}
+
+/* Clear the current packet filter rules, leaving no rules in force.
+ *
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+void clear_mdp_packet_rules()
+{
+  free_rule_list(packet_rules);
+  packet_rules = NULL;
+}
+
+/* (Re-)load the packet filter rules from the configured file.
+ *
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
+void reload_mdp_packet_rules()
+{
+  char rules_path[1024];
+  if (FORMF_SERVAL_ETC_PATH(rules_path, "%s", config.mdp.filter_rules_path)) {
+    unsigned char *buf = NULL;
+    size_t size = 16 * 1024; // maximum file size
+    if (malloc_read_whole_file(rules_path, &buf, &size) == -1)
+      WHYF("failed to read rules file %s", alloca_str_toprint(rules_path));
+    else {
+      assert(buf != NULL);
+      struct packet_rule *new_rules = parse_mdp_packet_rules((char *)buf, size);
+      if (new_rules)
+	set_mdp_packet_rules(new_rules);
+    }
+  }
 }

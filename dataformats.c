@@ -42,7 +42,7 @@ int strn_to_sid_t(sid_t *sid, const char *hex, const char **endp)
 {
   if (str_startswith(hex, "broadcast", endp)) {
     if (sid)
-    *sid = SID_BROADCAST;
+      *sid = SID_BROADCAST;
     return 0;
   }
   sid_t tmp;

@@ -705,4 +705,6 @@ int cf_reload();
 int cf_reload_strict();
 int cf_reload_permissive();
 
+void reload_mdp_packet_rules(void);
+
 #endif //__SERVAL_DNA__CONF_H

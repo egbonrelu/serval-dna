@@ -179,9 +179,22 @@ int cf_init()
   return 0;
 }
 
+/* (Re-)load and parse the configuration file.
+ *
+ * The 'strict' flag controls whether this function will load a defective config file.  If nonzero,
+ * then it will not load a defective file, but will log an error and return -1.  If zero, then it
+ * will load a defective file and use the 'permissive' flag to decide what to log and return.
+ *
+ * The 'permissive' flag only applies if 'strict' is zero, and determines how this function deals
+ * with a loaded defective config file.  If 'permissive' is zero, then it logs an error and returns
+ * -1.  If nonzero, then it logs a warning and returns 0.
+ *
+ * @author Andrew Bettison <andrew@servalproject.com>
+ */
 static int reload_and_parse(int permissive, int strict)
 {
   int result = CFOK;
+  int changed = 0;
   if (cf_limbo)
     result = cf_dfl_config_main(&config);
   if (result == CFOK || result == CFEMPTY) {
@@ -193,25 +206,28 @@ static int reload_and_parse(int permissive, int strict)
       config_meta = conffile_meta;
       if (result == CFOK || result == CFEMPTY) {
 	struct config_main new_config;
+	int update = 0;
 	memset(&new_config, 0, sizeof new_config);
 	result = cf_dfl_config_main(&new_config);
 	if (result == CFOK || result == CFEMPTY) {
 	  result = cf_om_root ? cf_opt_config_main(&new_config, cf_om_root) : CFEMPTY;
 	  if (result == CFOK || result == CFEMPTY) {
 	    result = CFOK;
-	    config = new_config;
+	    update = 1;
 	  } else if (result != CFERROR && !strict) {
 	    result &= ~CFEMPTY; // don't log "empty" as a problem
-	    config = new_config;
+	    update = 1;
 	  }
+	}
+	if (update && cf_cmp_config_main(&config, &new_config) != 0) {
+	  config = new_config;
+	  changed = 1;
 	}
       }
     }
   }
   int ret = 1;
-  if (result == CFOK) {
-    logConfigChanged();
-  } else {
+  if (result != CFOK) {
     strbuf b = strbuf_alloca(180);
     strbuf_cf_flag_reason(b, result);
     if (strict)
@@ -221,11 +237,14 @@ static int reload_and_parse(int permissive, int strict)
 	ret = WHYF("config file %s loaded despite defects -- %s", conffile_path(), strbuf_str(b));
       else
 	WARNF("config file %s loaded despite defects -- %s", conffile_path(), strbuf_str(b));
-      logConfigChanged();
     }
   }
   cf_limbo = 0; // let log messages out
   logFlush();
+  if (changed) {
+    logConfigChanged();
+    reload_mdp_packet_rules();
+  }
   return ret;
 }
 
